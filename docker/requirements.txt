@@ -1,4 +1,0 @@
-fugashi
-ipadic
-transformer
-addict

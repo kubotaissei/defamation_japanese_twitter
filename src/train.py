@@ -1,88 +1,559 @@
-import argparse
+# ====================================================
+# Library
+# ====================================================
+
+import warnings
+
+warnings.filterwarnings("ignore")
+
+import gc
+import hashlib
 import os
+import random
+import re
+import shutil
+from glob import glob
 from pathlib import Path
-from typing import Dict
+
+import hydra
+import numpy as np
 import pandas as pd
-
-from pytorch_lightning import Trainer, seed_everything
+import pytorch_lightning as pl
+import scipy as sp
+import tokenizers
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import transformers
+import wandb
+from omegaconf import DictConfig, OmegaConf
+from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.loggers.csv_logs import CSVLogger
-
-# from pytorch_lightning.plugins import DDPPlugin
-
-from dataset import CustomDataModule
-from factory import read_yaml
-from lightning_module import CustomLitModule
-
-
-def make_parse():
-    parser = argparse.ArgumentParser()
-    arg = parser.add_argument
-    arg("--debug", action="store_true", help="debug")
-    arg("--config", default="configs/sample.yaml", type=str, help="config path")
-    arg("--gpus", default="0", type=str, help="gpu numbers")
-    arg("--fold", default="0", type=str, help="fold number")
-    return parser
+from pytorch_lightning.loggers import CSVLogger, WandbLogger
+from sklearn.metrics import f1_score
+from sklearn.model_selection import StratifiedKFold
+from torch.optim import SGD, Adam, AdamW
+from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoTokenizer,
+    get_cosine_schedule_with_warmup,
+    get_linear_schedule_with_warmup,
+)
 
 
-def train(cfg_name: str, cfg: Dict, output_path: Path) -> None:
-    seed_everything(cfg.General.seed)
-    debug = cfg.General.debug
-    fold = cfg.Data.dataset.fold
+# ====================================================
+# Dataset
+# ====================================================
+class HatespeechDataset(Dataset):
+    def __init__(self, cfg_data, df, is_test=False):
+        self.cfg_data = cfg_data
+        self.texts = df[cfg_data.text_col].values
+        self.labels = df[cfg_data.label_col].values if not is_test else None
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg_data.tokenizer)
 
-    logger = CSVLogger(save_dir=str(output_path), name=f"fold_{fold}")
-    # wandb_logger = WandbLogger(
-    #     name=f"{cfg_name}_{fold}", project=cfg.General.project, offline=debug
-    # )
+    def __len__(self):
+        return len(self.texts)
 
-    early_stop_callback = EarlyStopping(
-        monitor="val_loss", min_delta=0.05, patience=3, mode="min"
+    def __getitem__(self, item):
+        encoding = self.tokenizer.encode_plus(
+            self.texts[item],
+            add_special_tokens=True,
+            max_length=self.cfg_data.max_len,
+            padding="max_length",
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+
+        inputs = dict(
+            text=self.texts[item],
+            input_ids=encoding["input_ids"].flatten(),
+            attention_mask=encoding["attention_mask"].flatten(),
+        )
+        if self.labels is not None:
+            inputs["labels"] = torch.tensor(self.labels[item])
+        return inputs
+
+
+class AttentionPooling(nn.Module):
+    def __init__(self, num_layers, hidden_size, hiddendim_fc):
+        super(AttentionPooling, self).__init__()
+        self.num_hidden_layers = num_layers
+        self.hidden_size = hidden_size
+        self.hiddendim_fc = hiddendim_fc
+        self.dropout = nn.Dropout(0.1)
+
+        q_t = np.random.normal(loc=0.0, scale=0.1, size=(1, self.hidden_size))
+        self.q = nn.Parameter(torch.from_numpy(q_t)).float()
+        w_ht = np.random.normal(
+            loc=0.0, scale=0.1, size=(self.hidden_size, self.hiddendim_fc)
+        )
+        self.w_h = nn.Parameter(torch.from_numpy(w_ht)).float()
+
+    def forward(self, all_hidden_states):
+        hidden_states = torch.stack(
+            [
+                all_hidden_states[layer_i][:, 0].squeeze()
+                for layer_i in range(1, self.num_hidden_layers + 1)
+            ],
+            dim=-1,
+        )
+        hidden_states = hidden_states.view(-1, self.num_hidden_layers, self.hidden_size)
+        out = self.attention(hidden_states)
+        out = self.dropout(out)
+        return out
+
+    def attention(self, h):
+        v = torch.matmul(self.q, h.transpose(-2, -1)).squeeze(1)
+        v = F.softmax(v, -1)
+        v_temp = torch.matmul(v.unsqueeze(1), h).transpose(-2, -1)
+        v = torch.matmul(self.w_h.transpose(1, 0), v_temp).squeeze(2)
+        return v
+
+
+# ====================================================
+# Model
+# ====================================================
+class CustomModel(nn.Module):
+    def __init__(self, cfg_model, config_path=None, pretrained=False):
+        super().__init__()
+        self.cfg_model = cfg_model
+        if config_path is None:
+            self.config = AutoConfig.from_pretrained(
+                cfg_model.pretrained, output_hidden_states=True
+            )
+        else:
+            self.config = torch.load(config_path)
+        if pretrained:
+            self.model = AutoModel.from_pretrained(
+                cfg_model.pretrained, config=self.config
+            )
+        else:
+            self.model = AutoModel(self.config)
+        if cfg_model.rnn == "LSTM":
+            self.rnn = nn.LSTM(
+                self.config.hidden_size,
+                self.config.hidden_size,
+                # bidirectional=True,
+                batch_first=True,
+            )
+        elif cfg_model.rnn == "GRU":
+            self.rnn = nn.GRU(
+                self.config.hidden_size,
+                self.config.hidden_size,
+                # bidirectional=True,
+                batch_first=True,
+            )
+        self.dropouts = nn.ModuleList(
+            [
+                nn.Dropout(self.cfg_model.multi_sample_dropout)
+                for _ in range(self.cfg_model.n_msd)
+            ]
+        )
+        self.pooler = AttentionPooling(
+            self.config.num_hidden_layers + 1, self.config.hidden_size, 128
+        )
+        self.fc = nn.Linear(self.config.hidden_size, 2)
+        if self.cfg_model.reinit_layers != "None":
+            for layer in self.model.encoder.layer[self.cfg_model.reinit_layers :]:
+                for module in layer.modules():
+                    self._init_weights(module)
+        self._init_weights(self.fc)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+
+    def forward(self, input_ids, attention_mask, labels=None):
+        outputs = self.model(input_ids, attention_mask=attention_mask)
+        all_hidden_states = torch.stack(outputs["hidden_states"])
+        rnn_out = (
+            self.rnn(outputs["last_hidden_state"], None)[0]
+            if self.cfg_model.rnn != "None"
+            else outputs["last_hidden_state"]
+        )
+        input_mask_expanded = (
+            attention_mask.unsqueeze(-1).expand(rnn_out.size()).float()
+        )
+        if self.cfg_model.pooling == "mean_old":
+            sequence_output = rnn_out.mean(axis=1)
+        elif self.cfg_model.pooling == "max_old":
+            sequence_output, _ = rnn_out.max(1)
+        elif self.cfg_model.pooling == "mean":
+            sum_embeddings = torch.sum(rnn_out * input_mask_expanded, 1)
+            sum_mask = input_mask_expanded.sum(1)
+            sum_mask = torch.clamp(sum_mask, min=1e-9)
+            sequence_output = sum_embeddings / sum_mask
+        elif self.cfg_model.pooling == "max":
+            rnn_out[
+                input_mask_expanded == 0
+            ] = -1e9  # Set padding tokens to large negative value
+            sequence_output = torch.max(rnn_out, 1)[0]
+        elif self.cfg_model.pooling == "attention":
+            sequence_output = self.pooler(
+                torch.cat([all_hidden_states, rnn_out.unsqueeze(0)])
+            )
+        else:
+            sequence_output = rnn_out[:, -1, :]
+        output = (
+            sum([self.fc(dropout(sequence_output)) for dropout in self.dropouts])
+            / self.cfg_model.n_msd
+        )
+        return output
+
+
+class CustomDataModule(pl.LightningDataModule):
+    """
+    DataFrameからモデリング時に使用するDataModuleを作成
+    """
+
+    def __init__(self, cfg, train_df, fold):
+        super().__init__()
+        self.cfg = cfg
+        self.fold = fold
+        self.train_df = train_df
+
+    def setup(self, stage=None):
+        self.train_folds = self.train_df[
+            self.train_df["fold"] != self.fold
+        ].reset_index(drop=True)
+        self.valid_folds = self.train_df[
+            self.train_df["fold"] == self.fold
+        ].reset_index(drop=True)
+        self.cfg.model.num_train_steps = int(
+            len(self.train_folds) / self.cfg.train.batch_size * self.cfg.train.epoch
+        )
+
+    def train_dataloader(self):
+        return DataLoader(
+            HatespeechDataset(self.cfg.data, self.train_folds),
+            batch_size=self.cfg.train.batch_size,
+            shuffle=True,
+            num_workers=self.cfg.base.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            HatespeechDataset(self.cfg.data, self.valid_folds),
+            batch_size=self.cfg.train.batch_size,
+            shuffle=False,
+            num_workers=self.cfg.base.num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+
+class CustomLitModule(pl.LightningModule):
+    def __init__(self, cfg, fold):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.model = CustomModel(cfg.model, config_path=None, pretrained=True)
+        self.criterion = nn.CrossEntropyLoss()
+        self.cfg = cfg
+        self.fold = fold
+
+    def forward(self, input_ids, attention_mask, labels=None):
+        logits = self.model(input_ids, attention_mask)
+        loss = 0 if labels is None else self.criterion(logits, labels)
+        return loss, logits
+
+    def training_step(self, batch, batch_idx):
+        loss, preds = self.forward(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            labels=batch["labels"],
+        )
+
+        sch = self.lr_schedulers()
+        if self.cfg.model.batch_scheduler:
+            sch.step()
+        return {"loss": loss, "batch_preds": preds, "batch_labels": batch["labels"]}
+
+    def validation_step(self, batch, batch_idx):
+        loss, preds = self.forward(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            labels=batch["labels"],
+        )
+        return {"loss": loss, "batch_preds": preds, "batch_labels": batch["labels"]}
+
+    def predict_step(self, batch, batch_idx):
+        _, preds = self.forward(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+        )
+        return preds
+
+    def validation_epoch_end(self, outputs, mode="val"):
+        # loss計算
+        epoch_preds = torch.cat([x["batch_preds"] for x in outputs])
+        epoch_labels = torch.cat([x["batch_labels"] for x in outputs])
+        epoch_loss = self.criterion(epoch_preds, epoch_labels)
+        self.log(f"{mode}_loss", epoch_loss, logger=True, prog_bar=True)
+        self.log(
+            f"{mode}_f1",
+            f1_score(epoch_labels.cpu(), epoch_preds.cpu().argmax(dim=1)),
+            logger=True,
+            prog_bar=True,
+        )
+
+    def configure_optimizers(self):
+        def get_optimizer_params(model, encoder_lr, decoder_lr, weight_decay=0.0):
+            no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+            optimizer_parameters = [
+                {
+                    "params": [
+                        p
+                        for n, p in model.model.named_parameters()
+                        if not any(nd in n for nd in no_decay)
+                    ],
+                    "lr": encoder_lr,
+                    "weight_decay": weight_decay,
+                },
+                {
+                    "params": [
+                        p
+                        for n, p in model.model.named_parameters()
+                        if any(nd in n for nd in no_decay)
+                    ],
+                    "lr": encoder_lr,
+                    "weight_decay": 0.0,
+                },
+                {
+                    "params": [
+                        p for n, p in model.named_parameters() if "model" not in n
+                    ],
+                    "lr": decoder_lr,
+                    "weight_decay": 0.0,
+                },
+            ]
+            return optimizer_parameters
+
+        optimizer_parameters = get_optimizer_params(
+            self.model,
+            encoder_lr=self.cfg.model.encoder_lr,
+            decoder_lr=self.cfg.model.decoder_lr,
+            weight_decay=self.cfg.model.weight_decay,
+        )
+        optimizer = AdamW(
+            optimizer_parameters,
+            lr=self.cfg.model.encoder_lr,
+            eps=self.cfg.model.eps,
+            betas=self.cfg.model.betas,
+        )
+        # ====================================================
+        # scheduler
+        # ====================================================
+        def get_scheduler(cfg, optimizer, num_train_steps):
+            if cfg.scheduler == "linear":
+                scheduler = get_linear_schedule_with_warmup(
+                    optimizer,
+                    num_warmup_steps=cfg.num_warmup_steps,
+                    num_training_steps=num_train_steps,
+                )
+            elif cfg.scheduler == "cosine":
+                scheduler = get_cosine_schedule_with_warmup(
+                    optimizer,
+                    num_warmup_steps=cfg.num_warmup_steps,
+                    num_training_steps=num_train_steps,
+                    num_cycles=cfg.num_cycles,
+                )
+            return scheduler
+
+        scheduler = {
+            "scheduler": get_scheduler(
+                self.cfg.model,
+                optimizer,
+                self.cfg.model.num_train_steps,
+            ),
+            "interval": "step" if self.cfg.model.batch_scheduler else "epoch",
+        }
+
+        return [optimizer], [scheduler]
+
+
+def prepair_dir(config: DictConfig):
+    """
+    Logの保存先を作成
+    """
+    for path in [
+        config.store.result_path,
+        config.store.log_path,
+        config.store.model_path,
+    ]:
+        if (
+            os.path.exists(path)
+            and config.train.warm_start is False
+            and config.data.is_train
+        ):
+            shutil.rmtree(path)
+        os.makedirs(path, exist_ok=True)
+
+
+def set_up(config: DictConfig):
+    # Setup
+    prepair_dir(config)
+    pl.seed_everything(config.data.seed)
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(config.base.gpu_id)
+
+
+@hydra.main(version_base=None, config_path="config", config_name="baseline")
+def main(config: DictConfig) -> int:
+    # ====================================================
+    # Data Loading
+    # ====================================================
+    os.chdir(config.store.workdir)
+    train = pd.read_csv(config.data.train_path)
+    test = pd.read_csv(config.data.test_path)
+
+    def clean_text(text):
+        return (
+            text.replace(" ", "")
+            .replace("　", "")
+            .replace("__BR__", "\n")
+            .replace("\xa0", "")
+            .replace("\r", "")
+            .lstrip("\n")
+        )
+
+    train["text"] = train["text"].apply(clean_text)
+    test["text"] = test["text"].apply(clean_text)
+
+    print(f"train.shape: {train.shape}")
+    print(f"test.shape: {test.shape}")
+
+    # ====================================================
+    # CV split
+    # ====================================================
+    Fold = StratifiedKFold(
+        n_splits=config.data.n_fold, shuffle=True, random_state=config.data.seed
     )
-    # 学習済重みを保存するために必要
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=str(output_path),
-        filename=f"{cfg_name}_fold_{fold}",
-        verbose=True,
-        monitor="val_loss",
-        mode="min",
+    for n, (train_index, val_index) in enumerate(
+        Fold.split(train, train[config.data.label_col].astype(int))
+    ):
+        train.loc[val_index, "fold"] = int(n)
+    train["fold"] = train["fold"].astype(int)
+    set_up(config)
+
+    hparams = {}
+    for key, value in config.items():
+        if isinstance(value, DictConfig):
+            hparams.update(value)
+        else:
+            hparams.update({key: value})
+
+    preds = []
+    results = []
+    test_dataloader = DataLoader(
+        HatespeechDataset(config.data, test, True),
+        batch_size=config.test.batch_size,
+        shuffle=False,
+        num_workers=config.base.num_workers,
+        pin_memory=True,
+        drop_last=False,
     )
-    trainer = Trainer(
-        max_epochs=5 if debug else cfg.General.epoch,
-        accelerator="gpu" if cfg.General.n_gpus else "cpu",
-        devices=cfg.General.n_gpus,
-        # distributed_backend=cfg.General.multi_gpu_mode,
-        amp_backend="native",
-        deterministic=True,
-        auto_select_gpus=False,
-        benchmark=False,
-        default_root_dir=os.getcwd(),
-        limit_train_batches=0.02 if debug else 1.0,
-        limit_val_batches=0.05 if debug else 1.0,
-        callbacks=[checkpoint_callback, early_stop_callback],
-        # logger=[logger, wandb_logger],
-        logger=[logger],
-        # For fast https://pytorch-lightning.readthedocs.io/en/1.3.3/benchmarking/performance.html#
+    for fold in config.train.trn_fold:
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=config.store.model_path,
+            filename=config.store.model_name + f"-fold{fold}" + "-{epoch}-{val_f1}",
+            monitor=config.train.callbacks.monitor_metric,
+            verbose=True,
+            save_top_k=1,
+            mode=config.train.callbacks.mode,
+            save_weights_only=False,
+        )
+        if config.store.wandb_project is not None:
+            logger = WandbLogger(
+                name=config.store.model_name + f"_fold{fold}",
+                save_dir=config.store.log_path,
+                project=config.store.wandb_project,
+                version=hashlib.sha224(
+                    bytes(str(hparams) + str(fold), "utf8")
+                ).hexdigest()[:4],
+                anonymous=True,
+                group=config.model.pretrained,
+                tags=[config.model.rnn, config.model.pooling],
+            )
+        else:
+            logger = None
+
+        early_stop_callback = EarlyStopping(
+            monitor=config.train.callbacks.monitor_metric,
+            patience=config.train.callbacks.patience,
+            verbose=True,
+            mode=config.train.callbacks.mode,
+        )
+
+        backend = "ddp" if len(config.base.gpu_id) > 1 else None
+        if config.train.warm_start:
+            checkpoint_path = sorted(
+                glob(config.store.model_path + "/*epoch*"),
+                key=lambda path: int(re.split("[=.]", path)[-2]),
+            )[-1]
+            print(checkpoint_path)
+        else:
+            checkpoint_path = None
+        params = {
+            "logger": logger,
+            "max_epochs": config.train.epoch,
+            "callbacks": [early_stop_callback, checkpoint_callback],
+            "accumulate_grad_batches": config.train.gradient_accumulation_steps,
+            "precision": 16,
+            "devices": len(config.base.gpu_id),
+            "accelerator": "gpu",
+            # "plugins": "ddp_sharded",
+            "limit_train_batches": 1.0,
+            "check_val_every_n_epoch": 1,
+            "limit_val_batches": 1.0,
+            "limit_test_batches": 0.0,
+            "num_sanity_val_steps": 5,
+            "num_nodes": 1,
+            "gradient_clip_val": 0.5,
+            "log_every_n_steps": 10,
+            "deterministic": False,
+            "resume_from_checkpoint": checkpoint_path,
+        }
+        datamodule = CustomDataModule(config, train, fold)
+        model = CustomLitModule(config, fold)
+        trainer = Trainer(**params)
+        trainer.fit(model, datamodule=datamodule)
+        results += trainer.validate(
+            model=model, dataloaders=datamodule.val_dataloader()
+        )
+        logits = trainer.predict(model=model, dataloaders=test_dataloader)
+        pred = torch.cat(logits)
+        test["label"] = pred.argmax(1)
+        test[["id", "label"]].to_csv(
+            config.store.result_path + f"/submission_fold{fold}.csv", index=None
+        )
+        print(test[["id", "label"]].groupby("label").count())
+        preds.append(pred)
+        wandb.finish()
+        del trainer, datamodule, model, logger
+        gc.collect()
+
+    result_df = pd.DataFrame(results)
+    print(result_df)
+    result_df.to_csv(config.store.result_path + "/result_cv.csv")
+    test["label"] = (sum(preds) / len(preds)).argmax(1)
+    test[["id", "label"]].to_csv(
+        config.store.result_path + "/submission_ave.csv", index=None
     )
-
-    # Lightning module and start training
-    model = CustomLitModule(cfg)
-    datamodule = CustomDataModule(cfg)
-    trainer.fit(model, datamodule=datamodule)
-
-
-def main():
-    args = make_parse().parse_args()
-
-    # Read config
-    cfg = read_yaml(fpath=args.config)
-    cfg.General.debug = args.debug
-    cfg.General.gpus = list(map(int, args.gpus.split(",")))
-    cfg.Data.dataset.fold = args.fold
-
-    output_path = f"../output"
-    # Start train
-    train(cfg_name=Path(args.config).stem, cfg=cfg, output_path=output_path)
 
 
 if __name__ == "__main__":
