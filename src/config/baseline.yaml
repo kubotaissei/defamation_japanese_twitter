@@ -1,7 +1,7 @@
 debug: False
 
 base:
-  gpu_id: ["0"]
+  gpu_id: ["2"]
   num_workers : 4
   loss_class: nn.CrossEntropyLoss
   opt_class: AdamW
@@ -16,14 +16,19 @@ data:
   test_path : ${store.workdir}/input/test.csv
   max_len : 77
   tokenizer: studio-ousia/luke-japanese-large
-  is_train: True
+  is_train: False
 
 model:
-  rnn : None # [None, 'GRU', 'LSTM']
-  pooling : mean  # [None, mean, max, attention, max_old, mean_old] # RANDOM SAMPLING
+  rnn : GRU # [None, 'GRU', 'LSTM']
+  pooling : None  # [None, mean, max, attention, max_old, mean_old] # RANDOM SAMPLING
   reinit_layers : -1
   multi_sample_dropout : 0.2
   n_msd : 7  # 5~8
+  embedding_size: 512
+  is_linear_head: False
+  pretrained: studio-ousia/luke-japanese-large
+  dropout_rate: 0.0
+  num_classes: 2
   # ::::::::::::::::::::::::::::::::::::::::::::::::::::
   # optimizer
   # ::::::::::::::::::::::::::::::::::::::::::::::::::::
@@ -41,11 +46,7 @@ model:
   num_cycles : 0.5
   num_warmup_steps : 0
   num_train_steps: 
-  embedding_size: 512
-  is_linear_head: False
-  pretrained: studio-ousia/luke-japanese-large
-  dropout_rate: 0.0
-  num_classes: 2
+
 
 store:
   workdir: /home/workspace/labo/hatespeech_detection

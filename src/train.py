@@ -2,6 +2,7 @@
 # Library
 # ====================================================
 
+import os
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -9,32 +10,26 @@ warnings.filterwarnings("ignore")
 import gc
 import hashlib
 import os
-import random
 import re
 import shutil
 from glob import glob
-from pathlib import Path
 
 import hydra
 import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
-import scipy as sp
-import tokenizers
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import transformers
 import wandb
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-from pytorch_lightning.loggers import CSVLogger, WandbLogger
+from pytorch_lightning.loggers import WandbLogger
 from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedKFold
 from torch.optim import SGD, Adam, AdamW
 from torch.utils.data import DataLoader, Dataset
-from tqdm.auto import tqdm
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -78,42 +73,6 @@ class HatespeechDataset(Dataset):
         return inputs
 
 
-class AttentionPooling(nn.Module):
-    def __init__(self, num_layers, hidden_size, hiddendim_fc):
-        super(AttentionPooling, self).__init__()
-        self.num_hidden_layers = num_layers
-        self.hidden_size = hidden_size
-        self.hiddendim_fc = hiddendim_fc
-        self.dropout = nn.Dropout(0.1)
-
-        q_t = np.random.normal(loc=0.0, scale=0.1, size=(1, self.hidden_size))
-        self.q = nn.Parameter(torch.from_numpy(q_t)).float()
-        w_ht = np.random.normal(
-            loc=0.0, scale=0.1, size=(self.hidden_size, self.hiddendim_fc)
-        )
-        self.w_h = nn.Parameter(torch.from_numpy(w_ht)).float()
-
-    def forward(self, all_hidden_states):
-        hidden_states = torch.stack(
-            [
-                all_hidden_states[layer_i][:, 0].squeeze()
-                for layer_i in range(1, self.num_hidden_layers + 1)
-            ],
-            dim=-1,
-        )
-        hidden_states = hidden_states.view(-1, self.num_hidden_layers, self.hidden_size)
-        out = self.attention(hidden_states)
-        out = self.dropout(out)
-        return out
-
-    def attention(self, h):
-        v = torch.matmul(self.q, h.transpose(-2, -1)).squeeze(1)
-        v = F.softmax(v, -1)
-        v_temp = torch.matmul(v.unsqueeze(1), h).transpose(-2, -1)
-        v = torch.matmul(self.w_h.transpose(1, 0), v_temp).squeeze(2)
-        return v
-
-
 # ====================================================
 # Model
 # ====================================================
@@ -152,9 +111,6 @@ class CustomModel(nn.Module):
                 nn.Dropout(self.cfg_model.multi_sample_dropout)
                 for _ in range(self.cfg_model.n_msd)
             ]
-        )
-        self.pooler = AttentionPooling(
-            self.config.num_hidden_layers + 1, self.config.hidden_size, 128
         )
         self.fc = nn.Linear(self.config.hidden_size, 2)
         if self.cfg_model.reinit_layers != "None":
@@ -201,10 +157,6 @@ class CustomModel(nn.Module):
                 input_mask_expanded == 0
             ] = -1e9  # Set padding tokens to large negative value
             sequence_output = torch.max(rnn_out, 1)[0]
-        elif self.cfg_model.pooling == "attention":
-            sequence_output = self.pooler(
-                torch.cat([all_hidden_states, rnn_out.unsqueeze(0)])
-            )
         else:
             sequence_output = rnn_out[:, -1, :]
         output = (
@@ -258,14 +210,13 @@ class CustomDataModule(pl.LightningDataModule):
 
 
 class CustomLitModule(pl.LightningModule):
-    def __init__(self, cfg, fold):
+    def __init__(self, cfg):
         super().__init__()
         self.save_hyperparameters()
 
         self.model = CustomModel(cfg.model, config_path=None, pretrained=True)
         self.criterion = nn.CrossEntropyLoss()
         self.cfg = cfg
-        self.fold = fold
 
     def forward(self, input_ids, attention_mask, labels=None):
         logits = self.model(input_ids, attention_mask)
@@ -297,6 +248,7 @@ class CustomLitModule(pl.LightningModule):
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
         )
+        preds = F.softmax(preds, dim=-1)
         return preds
 
     def validation_epoch_end(self, outputs, mode="val"):
@@ -314,12 +266,13 @@ class CustomLitModule(pl.LightningModule):
 
     def configure_optimizers(self):
         def get_optimizer_params(model, encoder_lr, decoder_lr, weight_decay=0.0):
+            param_optimizer = list(model.named_parameters())
             no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
             optimizer_parameters = [
                 {
                     "params": [
                         p
-                        for n, p in model.model.named_parameters()
+                        for n, p in param_optimizer
                         if not any(nd in n for nd in no_decay)
                     ],
                     "lr": encoder_lr,
@@ -327,17 +280,13 @@ class CustomLitModule(pl.LightningModule):
                 },
                 {
                     "params": [
-                        p
-                        for n, p in model.model.named_parameters()
-                        if any(nd in n for nd in no_decay)
+                        p for n, p in param_optimizer if any(nd in n for nd in no_decay)
                     ],
                     "lr": encoder_lr,
                     "weight_decay": 0.0,
                 },
                 {
-                    "params": [
-                        p for n, p in model.named_parameters() if "model" not in n
-                    ],
+                    "params": [p for n, p in param_optimizer if "model" not in n],
                     "lr": decoder_lr,
                     "weight_decay": 0.0,
                 },
@@ -406,7 +355,6 @@ def prepair_dir(config: DictConfig):
 
 
 def set_up(config: DictConfig):
-    # Setup
     prepair_dir(config)
     pl.seed_everything(config.data.seed)
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(config.base.gpu_id)
@@ -417,7 +365,9 @@ def main(config: DictConfig) -> int:
     # ====================================================
     # Data Loading
     # ====================================================
+    config.store.workdir = os.getcwd()
     os.chdir(config.store.workdir)
+    set_up(config)
     train = pd.read_csv(config.data.train_path)
     test = pd.read_csv(config.data.test_path)
 
@@ -448,7 +398,6 @@ def main(config: DictConfig) -> int:
     ):
         train.loc[val_index, "fold"] = int(n)
     train["fold"] = train["fold"].astype(int)
-    set_up(config)
 
     hparams = {}
     for key, value in config.items():
@@ -477,7 +426,7 @@ def main(config: DictConfig) -> int:
             mode=config.train.callbacks.mode,
             save_weights_only=False,
         )
-        if config.store.wandb_project is not None:
+        if config.store.wandb_project is not None and config.data.is_train:
             logger = WandbLogger(
                 name=config.store.model_name + f"_fold{fold}",
                 save_dir=config.store.log_path,
@@ -511,12 +460,13 @@ def main(config: DictConfig) -> int:
         params = {
             "logger": logger,
             "max_epochs": config.train.epoch,
-            "callbacks": [early_stop_callback, checkpoint_callback],
+            # "callbacks": [early_stop_callback, checkpoint_callback],
+            "callbacks": [checkpoint_callback],
             "accumulate_grad_batches": config.train.gradient_accumulation_steps,
             "precision": 16,
             "devices": len(config.base.gpu_id),
             "accelerator": "gpu",
-            # "plugins": "ddp_sharded",
+            "strategy": backend,
             "limit_train_batches": 1.0,
             "check_val_every_n_epoch": 1,
             "limit_val_batches": 1.0,
@@ -528,32 +478,53 @@ def main(config: DictConfig) -> int:
             "deterministic": False,
             "resume_from_checkpoint": checkpoint_path,
         }
+        model = CustomLitModule(config)
         datamodule = CustomDataModule(config, train, fold)
-        model = CustomLitModule(config, fold)
-        trainer = Trainer(**params)
-        trainer.fit(model, datamodule=datamodule)
-        results += trainer.validate(
-            model=model, dataloaders=datamodule.val_dataloader()
-        )
+        if config.data.is_train:
+            trainer = Trainer(**params)
+            trainer.fit(model, datamodule=datamodule)
+            results += trainer.validate(
+                model=model, dataloaders=datamodule.val_dataloader()
+            )
+        else:
+            state_dict = torch.load(
+                sorted(glob(config.store.model_path + "/*.ckpt"))[fold]
+            )["state_dict"]
+            model.load_state_dict(state_dict)
+            params.update(
+                {
+                    "devices": 1,
+                    "limit_train_batches": 0.0,
+                    "limit_val_batches": 0.0,
+                    "limit_test_batches": 1.0,
+                }
+            )
+            trainer = Trainer(**params)
         logits = trainer.predict(model=model, dataloaders=test_dataloader)
         pred = torch.cat(logits)
         test["label"] = pred.argmax(1)
+        test["pred"] = pred[:, 1]
         test[["id", "label"]].to_csv(
             config.store.result_path + f"/submission_fold{fold}.csv", index=None
         )
+        test.to_csv(config.store.result_path + f"/pred_fold{fold}.csv", index=None)
         print(test[["id", "label"]].groupby("label").count())
         preds.append(pred)
-        wandb.finish()
+        if config.store.wandb_project is not None and config.data.is_train:
+            wandb.finish()
         del trainer, datamodule, model, logger
         gc.collect()
 
-    result_df = pd.DataFrame(results)
-    print(result_df)
-    result_df.to_csv(config.store.result_path + "/result_cv.csv")
+    if config.data.is_train:
+        result_df = pd.DataFrame(results)
+        print(result_df)
+        result_df.to_csv(config.store.result_path + "/result_cv.csv")
     test["label"] = (sum(preds) / len(preds)).argmax(1)
+    test["pred"] = (sum(preds) / len(preds))[:, 1]
     test[["id", "label"]].to_csv(
         config.store.result_path + "/submission_ave.csv", index=None
     )
+    test.to_csv(config.store.result_path + "/pred_ave.csv", index=None)
 
 
 if __name__ == "__main__":
