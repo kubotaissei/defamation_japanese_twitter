@@ -54,4 +54,5 @@ RUN  pip install opencv-python \
      transformers \
      tokenizers \
      fugashi \
-     ipadic
+     ipadic \
+     sentencepiece

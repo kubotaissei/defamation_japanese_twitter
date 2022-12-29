@@ -2,6 +2,7 @@
 **.model
 **.npy
 **.ckpt
+**.csv
 **/hparams.yaml
 **/__pycache__/**
 **/lightning_logs/**
