@@ -11,9 +11,9 @@ class FocalLoss(nn.Module):
         self.gamma = gamma
 
     def forward(self, inputs, targets):
-        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-        pt = torch.exp(-bce_loss)
-        loss = self.alpha * (1.0 - pt) ** self.gamma * bce_loss
+        loss = F.cross_entropy(inputs, targets.to(torch.int64))
+        pt = torch.exp(-loss)
+        loss = self.alpha * (1.0 - pt) ** self.gamma * loss
         if self.reduction == "none":
             loss = loss
         elif self.reduction == "sum":
@@ -24,7 +24,7 @@ class FocalLoss(nn.Module):
 
 
 class SmoothFocalLoss(nn.Module):
-    def __init__(self, reduction="none", alpha=1, gamma=2, smoothing=0.0):
+    def __init__(self, reduction="none", alpha=1, gamma=2, smoothing=0.1):
         super().__init__()
         self.reduction = reduction
         self.focal_loss = FocalLoss(reduction, alpha, gamma)
@@ -49,17 +49,12 @@ class SmoothFocalLoss(nn.Module):
         return loss
 
 
-def get_cross_entropy():
-    loss_fn = nn.CrossEntropyLoss()
-    return loss_fn
-
-
-def get_loss(loss_class, **params):
-    print("loss class:", loss_class)
-    if "." in loss_class:
-        obj = eval(loss_class.split(".")[0])
-        attr = loss_class.split(".")[1]
+def get_loss(config_loss):
+    print("loss class:", config_loss.class_name)
+    if "." in config_loss.class_name:
+        obj = eval(config_loss.class_name.split(".")[0])
+        attr = config_loss.class_name.split(".")[1]
         f = getattr(obj, attr)
     else:
-        f = globals().get(loss_class)
-    return f(**params)
+        f = globals().get(config_loss.class_name)
+    return f(**config_loss.params)

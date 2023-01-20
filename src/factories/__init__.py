@@ -3,3 +3,4 @@ from .model import get_model
 from .scheduler import get_scheduler
 from .optimizer import get_optimizer
 from .loss import get_loss
+from .metric import get_metrics

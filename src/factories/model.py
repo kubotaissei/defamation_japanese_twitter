@@ -52,7 +52,7 @@ class CustomModel(nn.Module):
                 for _ in range(self.cfg_model.n_msd)
             ]
         )
-        self.fc = nn.Linear(self.config.hidden_size, 2)
+        self.fc = nn.Linear(self.config.hidden_size, self.cfg_model.num_classes)
         if self.cfg_model.reinit_layers != "None":
             for layer in self.model.encoder.layer[self.cfg_model.reinit_layers :]:
                 for module in layer.modules():

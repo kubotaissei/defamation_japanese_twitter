@@ -1,0 +1,89 @@
+defaults:
+  - _self_
+  - dataset: B1234
+
+debug: False
+
+base:
+  gpu_id: ["3"]
+  num_workers: 4
+  use_transformer_parameter: True
+  do_train: True
+  do_test: False
+
+data:
+  text_col: ${dataset.text_col}
+  label_col: ${dataset.label_col}
+  seed: 777
+  use_pseudo_label: False
+  n_fold: 5
+  train_path: ${store.workdir}/input/${dataset.train_file}
+  test_path: ${store.workdir}/input/${dataset.test_file}
+  max_len: ${dataset.max_len}
+  tokenizer: ${model.pretrained}
+
+model:
+  rnn: None # [None, 'GRU', 'LSTM']
+  pooling: attention # [None, mean, max, attention]
+  reinit_layers: -1
+  multi_sample_dropout: 0.2
+  n_msd: 7 # 5~8
+  # pretrained: studio-ousia/luke-japanese-large
+  pretrained: KoichiYasuoka/deberta-large-japanese-wikipedia
+  # pretrained: nlp-waseda/roberta-large-japanese
+  # pretrained: cl-tohoku/bert-large-japanese
+  num_classes: 4
+
+scheduler: 
+  class_name: cosine
+  batch_scheduler: True
+  num_cycles: 0.5
+  num_warmup_steps: 0
+  num_train_steps:
+
+optimizer:
+  class_name: AdamW
+  encoder_lr: 1e-5
+  decoder_lr: 1e-5
+  min_lr: 1e-6
+  eps: 1e-6
+  betas: [0.9, 0.999]
+  weight_decay: 0.2
+
+loss:
+  class_name: SmoothFocalLoss
+  params:
+    reduction: none
+    smoothing: 0
+# loss:
+#   class_name: 
+
+store:
+  workdir: ${oc.env:PWD}
+  model_name: ${model.pretrained}
+  root_path: ${store.workdir}/output
+  save_path: ${store.root_path}/${store.model_name}/${model.rnn}/${model.pooling}
+  model_path: ${store.save_path}/model
+  log_path: ${store.save_path}/logs
+  result_path: ${store.save_path}/result
+  wandb_project: research_final2
+
+train:
+  trn_fold: [0, 1, 2, 3, 4]
+  seed: ${data.seed}
+  epoch: 4
+  batch_size: 16
+  max_grad_norm: 1
+  gradient_accumulation_steps: 1
+  warm_start: False
+  callbacks:
+    monitor_metric: epoch
+    mode: max
+    patience: 2
+
+test:
+  batch_size: 256
+
+hydra:
+  run:
+    dir: ${store.save_path}

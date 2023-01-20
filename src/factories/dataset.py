@@ -5,10 +5,22 @@ from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 
 
+def clean_text(text):
+    return (
+        text.replace(" ", "")
+        .replace("@user", "")
+        .replace("　", "")
+        .replace("__BR__", "\n")
+        .replace("\xa0", "")
+        .replace("\r", "")
+        .lstrip("\n")
+    )
+
+
 class HatespeechDataset(Dataset):
     def __init__(self, data_config: DictConfig, df: pd.DataFrame, mode: str = "train"):
         self.data_config = data_config
-        self.texts = df[data_config.text_col].values
+        self.texts = df[data_config.text_col].apply(clean_text).values
         self.labels = df[data_config.label_col].values if mode != "test" else None
         self.tokenizer = AutoTokenizer.from_pretrained(data_config.tokenizer)
 
@@ -32,5 +44,5 @@ class HatespeechDataset(Dataset):
             attention_mask=encoding["attention_mask"].flatten(),
         )
         if self.labels is not None:
-            inputs["labels"] = torch.tensor(self.labels[item])
+            inputs["labels"] = torch.tensor(self.labels[item], dtype=torch.int64)
         return inputs
