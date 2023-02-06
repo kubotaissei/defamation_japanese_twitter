@@ -61,7 +61,7 @@ store:
   model_path: ${store.save_path}/model
   log_path: ${store.save_path}/logs
   result_path: ${store.save_path}/result
-  wandb_project: 
+  wandb_project: defamation_detection
 
 train:
   seed: ${data.seed}
