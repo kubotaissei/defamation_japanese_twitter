@@ -58,3 +58,5 @@ RUN  pip install opencv-python \
      ipadic \
      sentencepiece \
      crowd-kit
+
+WORKDIR /root/workdir
