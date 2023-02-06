@@ -61,7 +61,7 @@ store:
   model_path: ${store.save_path}/model
   log_path: ${store.save_path}/logs
   result_path: ${store.save_path}/result
-  wandb_project: test3
+  wandb_project: 
 
 train:
   seed: ${data.seed}
@@ -75,7 +75,7 @@ train:
     monitor_metric: epoch
     mode: max
     patience: 2
-    save_top_k: 1
+    save_top_k: 0
 
 test:
   batch_size: 256

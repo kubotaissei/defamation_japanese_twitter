@@ -51,8 +51,10 @@ RUN  pip install opencv-python \
      threadpoolctl \
      scikit-learn \
      kaggle \
-     transformers \
+     transformers==4.26 \
+     datasets==2.8.0 \
      tokenizers \
      fugashi \
      ipadic \
-     sentencepiece
+     sentencepiece \
+     crowd-kit
