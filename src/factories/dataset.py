@@ -18,11 +18,15 @@ def clean_text(text):
 
 
 class HatespeechDataset(Dataset):
-    def __init__(self, data_config: DictConfig, df: pd.DataFrame, mode: str = "train"):
+    def __init__(self, data_config: DictConfig, df: pd.DataFrame):
         self.data_config = data_config
         self.texts = df[data_config.text_col].apply(clean_text).values
-        self.labels = df[data_config.label_col].values if mode != "test" else None
         self.tokenizer = AutoTokenizer.from_pretrained(data_config.tokenizer)
+        self.labels = df[data_config.soft_label_col].values
+        # if data_config.label_type == "soft" and mode != "test":
+        #     self.labels = df[data_config.soft_label_col].values
+        # else:
+        #     self.labels = df[data_config.hard_label_col].values
 
     def __len__(self):
         return len(self.texts)
@@ -44,5 +48,5 @@ class HatespeechDataset(Dataset):
             attention_mask=encoding["attention_mask"].flatten(),
         )
         if self.labels is not None:
-            inputs["labels"] = torch.tensor(self.labels[item], dtype=torch.int64)
+            inputs["labels"] = torch.tensor(self.labels[item])
         return inputs

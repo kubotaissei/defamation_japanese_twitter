@@ -1,83 +1,81 @@
 defaults:
   - _self_
-  - dataset: hatespeech
 
 debug: False
 
 base:
   gpu_id: ["0"]
   num_workers: 4
-  opt_class: AdamW
-  loss_class: nn.CrossEntropyLoss
   use_transformer_parameter: True
+  do_train: True
+  do_test: True
 
 data:
-  text_col: ${dataset.text_col}
-  label_col: ${dataset.label_col}
+  agg_type: ds #[mv, ds, gl]
+  type: label #[label, target]
+  label_type: soft #[hard, soft]
+  soft_label_col: ${data.agg_type}_soft_${data.type}
+  hard_label_col: ${data.agg_type}_hard_${data.type}
+  text_col: text
   seed: 777
-  use_pseudo_label: False
-  n_fold: 5
-  train_path: ${store.workdir}/input/${dataset.train_file}
-  test_path: ${store.workdir}/input/${dataset.test_file}
-  max_len: ${dataset.max_len}
-  tokenizer: studio-ousia/luke-japanese-large
-  batch_size: 16
-  is_train: True
+  train_path: ${store.workdir}/input/train.pkl
+  test_path: ${store.workdir}/input/test.pkl
+  max_len: 475
+  tokenizer: ${model.pretrained}
 
 model:
-  rnn: GRU # [None, 'GRU', 'LSTM']
-  pooling: None # [None, , max, attention]
-  reinit_layers: -1
-  multi_sample_dropout: 0.2
-  n_msd: 7 # 5~8
-  embedding_size: 512
-  is_linear_head: False
+  rnn: None # [None, 'GRU', 'LSTM']
+  pooling: None # [None, mean, max, attention]
+  num_reinit_layers: 1 # 0~6
+  dropout: 0.2
+  n_msd: 6 # 5~8
+  mixout: 0 # 0.0~1.0
   pretrained: studio-ousia/luke-japanese-large
-  dropout_rate: 0.0
-  num_classes: 2
-  # ::::::::::::::::::::::::::::::::::::::::::::::::::::
-  # optimizer
-  # ::::::::::::::::::::::::::::::::::::::::::::::::::::
-  encoder_lr: 1e-5
-  decoder_lr: 1e-5
-  min_lr: 1e-6
-  eps: 1e-6
-  betas: [0.9, 0.999]
-  weight_decay: 0.2
-  # ::::::::::::::::::::::::::::::::::::::::::::::::::::
-  # scheduler
-  # ::::::::::::::::::::::::::::::::::::::::::::::::::::
-  scheduler: cosine
+  num_classes: 4
+
+scheduler: 
+  class_name: cosine
   batch_scheduler: True
   num_cycles: 0.5
   num_warmup_steps: 0
   num_train_steps:
 
+optimizer:
+  class_name: AdamW
+  encoder_lr: 1e-5
+  decoder_lr: 1e-5
+  eps: 1e-6
+  betas: [0.9, 0.999]
+  weight_decay: 0.2
+
+loss:
+  class_name: FocalLoss
+  params:
+    gamma: 10
+
 store:
   workdir: ${oc.env:PWD}
-  model_name: baseline
+  model_name: ${model.pretrained}
   root_path: ${store.workdir}/output
-  save_path: ${store.root_path}/${store.model_name}/${model.rnn}/${model.pooling}
+  save_path: ${store.root_path}/${store.model_name}/${model.mixout}/${data.label_type}/${data.agg_type}/${model.num_reinit_layers}/${model.mixout}${optimizer.decoder_lr}
   model_path: ${store.save_path}/model
   log_path: ${store.save_path}/logs
   result_path: ${store.save_path}/result
-  wandb_project: 
+  wandb_project: test3
 
 train:
-  trn_fold: [0, 1, 2, 3, 4]
   seed: ${data.seed}
   epoch: 4
+  n_fold: 5
   batch_size: 16
   max_grad_norm: 1
   gradient_accumulation_steps: 1
-  learning_rate: 0.000001
   warm_start: False
-  scheduler:
-    patience: 5
   callbacks:
     monitor_metric: epoch
     mode: max
     patience: 2
+    save_top_k: 1
 
 test:
   batch_size: 256

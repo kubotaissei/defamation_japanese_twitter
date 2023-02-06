@@ -4,14 +4,15 @@ import torch.nn.functional as F
 
 
 class FocalLoss(nn.Module):
-    def __init__(self, reduction="none", alpha=1, gamma=2):
+    def __init__(self, reduction="mean", alpha=1, gamma=2):
         super().__init__()
         self.reduction = reduction
         self.alpha = alpha
         self.gamma = gamma
+        print(self.gamma)
 
     def forward(self, inputs, targets):
-        loss = F.cross_entropy(inputs, targets.to(torch.int64))
+        loss = F.cross_entropy(inputs, targets, reduction="none")
         pt = torch.exp(-loss)
         loss = self.alpha * (1.0 - pt) ** self.gamma * loss
         if self.reduction == "none":
@@ -24,10 +25,10 @@ class FocalLoss(nn.Module):
 
 
 class SmoothFocalLoss(nn.Module):
-    def __init__(self, reduction="none", alpha=1, gamma=2, smoothing=0.1):
+    def __init__(self, reduction="mean", alpha=1, gamma=2, smoothing=0.0):
         super().__init__()
         self.reduction = reduction
-        self.focal_loss = FocalLoss(reduction, alpha, gamma)
+        self.focal_loss = FocalLoss("none", alpha, gamma)
         self.smoothing = smoothing
 
     @staticmethod
@@ -49,12 +50,12 @@ class SmoothFocalLoss(nn.Module):
         return loss
 
 
-def get_loss(config_loss):
-    print("loss class:", config_loss.class_name)
-    if "." in config_loss.class_name:
-        obj = eval(config_loss.class_name.split(".")[0])
-        attr = config_loss.class_name.split(".")[1]
+def get_loss(loss_class, params):
+    print("loss class:", loss_class)
+    if "." in loss_class:
+        obj = eval(loss_class.split(".")[0])
+        attr = loss_class.split(".")[1]
         f = getattr(obj, attr)
     else:
-        f = globals().get(config_loss.class_name)
-    return f(**config_loss.params)
+        f = globals().get(loss_class)
+    return f(**params)

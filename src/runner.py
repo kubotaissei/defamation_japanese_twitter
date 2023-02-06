@@ -20,28 +20,35 @@ class CustomDataModule(pl.LightningDataModule):
         super().__init__()
         self.config = config
         self.fold = fold
-        self.train_df = pd.read_csv(config.data.train_path)
+        self.train_df = pd.read_pickle(config.data.train_path)
         print(f"train.shape: {self.train_df.shape}")
+        self.test_df = pd.read_pickle(config.data.test_path)
+        print(f"test.shape: {self.test_df.shape}")
 
     def setup(self, stage=None) -> None:
-        Fold = StratifiedKFold(
-            n_splits=self.config.data.n_fold,
-            shuffle=True,
-            random_state=self.config.data.seed,
-        )
-        for n, (train_index, val_index) in enumerate(
-            Fold.split(
-                self.train_df, self.train_df[self.config.data.label_col].astype(int)
+        if self.config.train.n_fold > 1:
+            Fold = StratifiedKFold(
+                n_splits=self.config.train.n_fold,
+                shuffle=True,
+                random_state=self.config.data.seed,
             )
-        ):
-            self.train_df.loc[val_index, "fold"] = int(n)
-        self.train_df["fold"] = self.train_df["fold"].astype(int)
-        self.train_folds = self.train_df[
-            self.train_df["fold"] != self.fold
-        ].reset_index(drop=True)
-        self.valid_folds = self.train_df[
-            self.train_df["fold"] == self.fold
-        ].reset_index(drop=True)
+            for n, (train_index, val_index) in enumerate(
+                Fold.split(
+                    self.train_df,
+                    self.train_df[self.config.data.hard_label_col].astype(int),
+                )
+            ):
+                self.train_df.loc[val_index, "fold"] = int(n)
+            self.train_df["fold"] = self.train_df["fold"].astype(int)
+            self.train_folds = self.train_df[
+                self.train_df["fold"] != self.fold
+            ].reset_index(drop=True)
+            self.valid_folds = self.train_df[
+                self.train_df["fold"] == self.fold
+            ].reset_index(drop=True)
+        else:
+            self.train_folds = self.train_df
+            self.valid_folds = self.test_df
         self.config.scheduler.num_train_steps = int(
             len(self.train_folds)
             / self.config.train.batch_size
@@ -69,6 +76,26 @@ class CustomDataModule(pl.LightningDataModule):
             drop_last=False,
         )
 
+    def test_dataloader(self):
+        return DataLoader(
+            HatespeechDataset(self.config.data, self.test_df),
+            batch_size=self.config.test.batch_size,
+            shuffle=False,
+            num_workers=self.config.base.num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+    def predict_dataloader(self):
+        return DataLoader(
+            HatespeechDataset(self.config.data, self.test_df),
+            batch_size=self.config.test.batch_size,
+            shuffle=False,
+            num_workers=self.config.base.num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+
 
 class CustomLitModule(pl.LightningModule):
     def __init__(self, config):
@@ -76,7 +103,7 @@ class CustomLitModule(pl.LightningModule):
         self.save_hyperparameters()
 
         self.model = get_model(config.model)
-        self.criterion = get_loss(config.loss)
+        self.criterion = get_loss(config.loss.class_name, config.loss.params)
         self.config = config
 
     def forward(self, input_ids, attention_mask, labels=None):
@@ -102,6 +129,9 @@ class CustomLitModule(pl.LightningModule):
         preds = F.softmax(preds, dim=-1)
         return {"loss": loss, "batch_preds": preds, "batch_labels": batch["labels"]}
 
+    def test_step(self, batch, batch_idx):
+        return self.validation_step(batch, batch_idx)
+
     def predict_step(self, batch, batch_idx):
         _, preds = self.forward(
             input_ids=batch["input_ids"],
@@ -114,9 +144,14 @@ class CustomLitModule(pl.LightningModule):
         epoch_preds = torch.cat([x["batch_preds"] for x in outputs])
         epoch_labels = torch.cat([x["batch_labels"] for x in outputs])
         epoch_loss = self.criterion(epoch_preds, epoch_labels)
-        self.log(f"{mode}_loss", epoch_loss, logger=True, prog_bar=True)
+        self.log(f"{mode}_loss", epoch_loss, logger=True, prog_bar=True, sync_dist=True)
+        if epoch_labels.dim() == 2:
+            epoch_labels = epoch_labels.argmax(dim=1)
         d = get_metrics(epoch_labels.cpu(), epoch_preds.cpu(), mode)
-        self.log_dict(d, prog_bar=True)
+        self.log_dict(d, prog_bar=True, sync_dist=True)
+
+    def test_epoch_end(self, outputs, mode="test"):
+        return self.validation_epoch_end(outputs, mode)
 
     def configure_optimizers(self):
         if self.config.base.use_transformer_parameter:
