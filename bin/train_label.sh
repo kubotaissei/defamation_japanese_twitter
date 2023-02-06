@@ -1,4 +1,5 @@
 docker run --rm -it \
+    --gpus '"device=0"' \
     -v $PWD/:/root/workdir/ \
     -v $HOME/.ssh/:/root/.ssh \
     -v $HOME/.config/:/root/.config \
