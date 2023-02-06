@@ -6,4 +6,4 @@ docker run --rm -it \
     -v $HOME/.cache/:/root/.cache \
     --ipc=host \
     defamation:cuda11 \
-    python ./scripts/download_and_preprocess.py $1
+    cd root/workdir & python scripts/download_and_preprocess.py $0
