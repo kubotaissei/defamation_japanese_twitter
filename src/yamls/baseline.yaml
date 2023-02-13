@@ -22,6 +22,7 @@ data:
   test_path: ${store.workdir}/input/test.pkl
   max_len: 475
   tokenizer: ${model.pretrained}
+  binary: False
 
 model:
   rnn: None # [None, 'GRU', 'LSTM']

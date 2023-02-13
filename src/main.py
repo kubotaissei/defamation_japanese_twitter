@@ -55,6 +55,8 @@ def main(config: DictConfig):
             hparams.update({key: value})
     preds = []
     test_result = []
+    if config.data.binary:
+        config.model.num_classes = 2
     if config.debug:
         config.train.epoch = 1
         config.train.n_fold = 2
@@ -147,8 +149,14 @@ def main(config: DictConfig):
         test[f"pred_{config.data.hard_label_col}_ensemble"] = (
             sum(preds) / len(preds)
         ).tolist()
+        if config.data.binary:
+            label = torch.Tensor(
+                (test[config.data.hard_label_col] != 0).astype(int).to_list()
+            )
+        else:
+            label = torch.Tensor(test[config.data.hard_label_col].to_list())
         result = get_metrics(
-            torch.Tensor(test[config.data.hard_label_col].to_list()),
+            label,
             sum(preds) / len(preds),
             "test_ensemble",
         )

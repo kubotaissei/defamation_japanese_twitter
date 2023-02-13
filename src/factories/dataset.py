@@ -22,11 +22,10 @@ class HatespeechDataset(Dataset):
         self.data_config = data_config
         self.texts = df[data_config.text_col].apply(clean_text).values
         self.tokenizer = AutoTokenizer.from_pretrained(data_config.tokenizer)
-        self.labels = df[data_config.soft_label_col].values
-        # if data_config.label_type == "soft" and mode != "test":
-        #     self.labels = df[data_config.soft_label_col].values
-        # else:
-        #     self.labels = df[data_config.hard_label_col].values
+        if data_config.binary:
+            self.labels = (df[data_config.hard_label_col] != 0).astype(int).values
+        else:
+            self.labels = df[data_config.soft_label_col].values
 
     def __len__(self):
         return len(self.texts)
